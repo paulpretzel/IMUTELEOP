@@ -1,0 +1,4 @@
+firmware/**/secrets.h
+__pycache__/
+*.pyc
+imu_telemetry_*.csv
