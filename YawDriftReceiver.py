@@ -86,6 +86,41 @@ def body_rates_dps(q_old, q_new, dt):
     return dx * k, dy * k, dz * k
 
 
+def twist_z_deg(q):
+    """Rotation about world z contained in q (swing-twist decomposition)."""
+    return wrap180(math.degrees(2.0 * math.atan2(q[3], q[0])))
+
+
+def pose_delta_heading_deg(q, q_ref):
+    """Heading change between two orientations, measured about world z.
+
+    Unlike any single "yaw" number, this has no gimbal-lock pose: it is the
+    world-z twist of q * q_ref^-1, which is well defined unless the sensor is
+    flipped ~180 deg about a horizontal axis relative to q_ref. Return the
+    sensor to the reference pose and this reads the accumulated drift directly.
+    """
+    return twist_z_deg(q_mul(q, q_conj(q_ref)))
+
+
+PACKET_FIELDS_V1 = 5   # ms,W,X,Y,Z
+PACKET_FIELDS_V2 = 14  # + still,tempC,bias xyz,integ xyz,fifo_overflows
+
+
+def parse_packet(text):
+    """Parse one telemetry line from either firmware version. Raises ValueError."""
+    parts = text.strip().split(",")
+    if len(parts) not in (PACKET_FIELDS_V1, PACKET_FIELDS_V2):
+        raise ValueError("field count")
+    vals = [float(p) for p in parts]
+    if not all(math.isfinite(v) for v in vals):
+        raise ValueError("non-finite")
+    pkt = dict(t_ms=vals[0], wxyz=tuple(vals[1:5]), still=None, temp=None, bias=None, integ=None, ovf=None)
+    if len(vals) == PACKET_FIELDS_V2:
+        pkt.update(still=vals[5] >= 0.5, temp=vals[6], bias=tuple(vals[7:10]), integ=tuple(vals[10:13]),
+                   ovf=int(vals[13]))
+    return pkt
+
+
 def lsq_slope(pts):
     n = len(pts)
     if n < 3:
@@ -330,6 +365,7 @@ class App:
         self.last_flush = time.time()
         self.shown_state = None
         self.drift_rate = None
+        self.q_zero = None
 
         # ---- CSV LOGGING ----
         self.csv = None
@@ -337,7 +373,8 @@ class App:
         if not args.no_csv:
             self.csv_name = f"imu_telemetry_compass_{datetime.now().strftime('%H%M%S')}.csv"
             self.csv = open(self.csv_name, "w", encoding="utf-8")
-            self.csv.write("Time_ms,W,X,Y,Z,Bounded_Yaw,Roll,Pitch,Yaw_Raw,Omega_dps,Drift_dpm\n")
+            self.csv.write("Time_ms,W,X,Y,Z,Bounded_Yaw,Roll,Pitch,Yaw_Raw,Omega_dps,Drift_dpm,"
+                           "Pose_dHeading,Still,TempC,Bias_x,Bias_y,Bias_z,FifoOvf\n")
         self.recording = self.csv is not None
 
         self._build_scene()
@@ -428,6 +465,8 @@ class App:
     # --------------------------------------------------------------- controls
     def on_zero(self, b=None):
         self.yaw.rezero()
+        if self.sample:
+            self.q_zero = self.sample["q"]
         print("[ACTION] Yaw reference mathematically zeroed.")
 
     def on_freeze(self, b=None):
@@ -453,25 +492,23 @@ class App:
     # ----------------------------------------------------------- packet logic
     def handle_packet(self, arrive, addr, data):
         try:
-            parts = data.decode("ascii", "ignore").strip().split(",")
-            if len(parts) != 5:
-                raise ValueError("field count")
-            t_ms, w, x, y, z = (float(p) for p in parts)
-            if not all(math.isfinite(v) for v in (t_ms, w, x, y, z)):
-                raise ValueError("non-finite")
+            pkt = parse_packet(data.decode("ascii", "ignore"))
         except ValueError:
             self.link.bad += 1
             return
-        q, qn = q_normalize(w, x, y, z)
+        t_ms = pkt["t_ms"]
+        q, qn = q_normalize(*pkt["wxyz"])
         if q is None:
             self.link.bad += 1
             return
+        w, x, y, z = q
 
         if self.link.on_packet(arrive, t_ms, addr):
             self.t_shift = self.last_t_s - t_ms / 1000.0 + 1.0 / self.args.hz
             self.yaw.reset()
             self.motion.reset()
             self.drift.reset()
+            self.q_zero = None
             print("[WARNING] ESP32 tracker restarted. Hardware filter reset, yaw re-zeroed.")
 
         if self.t_shift is None:
@@ -493,17 +530,25 @@ class App:
             print(f"[SUCCESS] Visualizer initialized. Initial Y-Axis offset: {y_axis_yaw:.2f} deg")
 
         yaw_b, drift_total = self.yaw.bounded, self.yaw.drift_total
+        if self.q_zero is None:
+            self.q_zero = q
+        pose_dh = pose_delta_heading_deg(q, self.q_zero)
         self.motion.push(t_s, q)
         speed = self.motion.speed
         self.peak_speed = max(self.peak_speed, speed)
 
         self.sample = dict(t=t_s, w=w, x=x, y=y, z=z, qn=qn, roll=roll, pitch=pitch, yaw_raw=yaw_raw,
-                           yaw=yaw_b, drift=drift_total, speed=speed)
+                           yaw=yaw_b, drift=drift_total, speed=speed, q=q, pose_dh=pose_dh,
+                           still=pkt["still"], temp=pkt["temp"], bias=pkt["bias"], ovf=pkt["ovf"])
 
         if self.recording and self.csv:
             dr = "" if self.drift_rate is None else f"{self.drift_rate:.3f}"
+            node = ",,,,,"
+            if pkt["bias"] is not None:
+                bx, by, bz = pkt["bias"]
+                node = f"{int(pkt['still'])},{pkt['temp']:.2f},{bx:.4f},{by:.4f},{bz:.4f},{pkt['ovf']}"
             self.csv.write(f"{t_ms:.2f},{w:.5f},{x:.5f},{y:.5f},{z:.5f},{yaw_b:.2f},"
-                           f"{roll:.2f},{pitch:.2f},{yaw_raw:.2f},{speed:.3f},{dr}\n")
+                           f"{roll:.2f},{pitch:.2f},{yaw_raw:.2f},{speed:.3f},{dr},{pose_dh:.3f},{node}\n")
 
         if not self.frozen:
             self._update_twin(*q)
@@ -581,7 +626,9 @@ class App:
             top = "".join([card("BOUNDED YAW (Y-AXIS)", ph, "\u00b0", accent=C_CYAN, grow=1),
                            card("ABSOLUTE DRIFT", ph, "\u00b0", accent=C_AMBER, grow=1),
                            card("SESSION TIME", ph, "s", accent=C_VIOLET, grow=1)])
-            return row(top, opacity=dim)
+            bottom = "".join([card("\u0394 HEADING vs ZERO POSE", ph, "\u00b0", accent=C_GREEN, grow=1),
+                              card("NODE", ph, "", accent=C_MUTED, grow=2)])
+            return row(top, opacity=dim) + row(bottom, opacity=dim)
 
         if self.drift_rate is not None:
             dr_sub = f"stable drift: {self.drift_rate:+.3f} \u00b0/min"
@@ -596,7 +643,19 @@ class App:
             card("SESSION TIME", f"{int(self.last_t_s // 60):02d}:{self.last_t_s % 60:05.2f}", "s",
                  "Active Telemetry Runtime", C_VIOLET, 1),
         ])
-        return row(top, opacity=dim)
+        if s["bias"] is None:
+            node_val, node_sub = "v1", "old firmware: no node diagnostics"
+        else:
+            bx, by, bz = s["bias"]
+            node_val = (f"<span style='color:{C_GREEN if s['still'] else C_AMBER}'>"
+                        f"{'STILL' if s['still'] else 'MOVING'}</span> {s['temp']:.1f}\u00b0C")
+            node_sub = f"gyro bias {bx:+.3f} {by:+.3f} {bz:+.3f} \u00b0/s &middot; FIFO overflows {s['ovf']}"
+        bottom = "".join([
+            card("\u0394 HEADING vs ZERO POSE", fmt(s["pose_dh"]), "\u00b0",
+                 "return to the zeroed pose: this is the drift", C_GREEN, 1),
+            card("NODE", node_val, "", node_sub, C_MUTED, 2),
+        ])
+        return row(top, opacity=dim) + row(bottom, opacity=dim)
 
     # ------------------------------------------------------------------- run
     def pump(self):
